@@ -5,9 +5,12 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log"
+	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -26,6 +29,12 @@ const (
 
 // SessionItem 会话项结构
 type SessionItem map[string]interface{}
+
+// MemorySession 内存session数据结构（需要根据实际结构调整）
+type MemorySession struct {
+	Data   map[string]interface{}
+	Expiry time.Time
+}
 
 // convertInterfaceMapToStringMap 将 map[interface{}]interface{} 转换为 map[string]interface{}
 func convertInterfaceMapToStringMap(rawData map[interface{}]interface{}) map[string]interface{} {
@@ -73,6 +82,106 @@ func extractSessionDataFromMemory(sessionData interface{}) (map[string]interface
 		// 如果无法直接转换，返回空map
 		return result, nil
 	}
+}
+
+// getAllSessionsFromStore 从session store中获取所有session
+func getAllSessionsFromStore(store interface{}) (map[string]SessionItem, error) {
+	sessions := make(map[string]SessionItem)
+	
+	// 方法1: 通过反射访问内存存储的内部数据
+	storeValue := reflect.ValueOf(store)
+	if storeValue.Kind() == reflect.Ptr {
+		storeValue = storeValue.Elem()
+	}
+	
+	// 尝试查找存储session的字段（通常是sync.Map或map类型）
+	for i := 0; i < storeValue.NumField(); i++ {
+		field := storeValue.Field(i)
+		fieldType := storeValue.Type().Field(i)
+		
+		// 查找可能存储session的字段
+		if strings.Contains(strings.ToLower(fieldType.Name), "session") ||
+		   strings.Contains(strings.ToLower(fieldType.Name), "data") ||
+		   strings.Contains(strings.ToLower(fieldType.Name), "store") {
+			
+			if field.Kind() == reflect.Map {
+				// 如果是普通map
+				for _, key := range field.MapKeys() {
+					value := field.MapIndex(key)
+					sessionKey := fmt.Sprintf("%v", key.Interface())
+					
+					if sessionItem, err := processSessionData(sessionKey, value.Interface()); err == nil {
+						sessions[sessionKey] = sessionItem
+					}
+				}
+			} else if field.Type().String() == "sync.Map" {
+				// 如果是sync.Map，使用unsafe包访问
+				if syncMap, ok := field.Interface().(*sync.Map); ok {
+					syncMap.Range(func(key, value interface{}) bool {
+						sessionKey := fmt.Sprintf("%v", key)
+						if sessionItem, err := processSessionData(sessionKey, value); err == nil {
+							sessions[sessionKey] = sessionItem
+						}
+						return true
+					})
+				}
+			}
+		}
+	}
+	
+	return sessions, nil
+}
+
+// processSessionData 处理单个session数据
+func processSessionData(sessionKey string, sessionData interface{}) (SessionItem, error) {
+	var expiry int64
+	var sessionDataMap map[string]interface{}
+	
+	// 尝试从session数据中提取信息
+	switch data := sessionData.(type) {
+	case map[string]interface{}:
+		sessionDataMap = data
+		// 查找过期时间
+		if exp, exists := data["expiry"]; exists {
+			if expTime, ok := exp.(int64); ok {
+				expiry = expTime
+			} else if expTime, ok := exp.(time.Time); ok {
+				expiry = expTime.Unix()
+			}
+		}
+	case *MemorySession:
+		sessionDataMap = data.Data
+		expiry = data.Expiry.Unix()
+	default:
+		// 尝试通过反射获取数据
+		val := reflect.ValueOf(sessionData)
+		if val.Kind() == reflect.Ptr {
+			val = val.Elem()
+		}
+		
+		sessionDataMap = make(map[string]interface{})
+		
+		// 查找Data字段
+		if dataField := val.FieldByName("Data"); dataField.IsValid() {
+			if dataMap, ok := dataField.Interface().(map[string]interface{}); ok {
+				sessionDataMap = dataMap
+			}
+		}
+		
+		// 查找Expiry字段
+		if expiryField := val.FieldByName("Expiry"); expiryField.IsValid() {
+			if expiryTime, ok := expiryField.Interface().(time.Time); ok {
+				expiry = expiryTime.Unix()
+			}
+		}
+	}
+	
+	// 如果没有找到过期时间，设置默认值
+	if expiry == 0 {
+		expiry = time.Now().Add(24 * time.Hour).Unix()
+	}
+	
+	return createSessionItem(expiry, sessionKey, sessionDataMap), nil
 }
 
 // createSessionItem 创建会话项
@@ -211,111 +320,62 @@ func GetOnlineUser(c CtxHelper) error {
 	// 验证分页参数
 	page, limit = validateAndNormalizePagination(page, limit)
 
-	// 从内存存储获取所有session数据
-	// 假设Storage有一个方法可以获取所有session
-	// 这里需要根据你实际使用的内存存储来调整
-	var allSessions []SessionItem
+	// 从session store获取所有session数据
+	var allSessionsSlice []SessionItem
 	
-	// 方法1: 如果Storage有GetAll方法
-	if sessions, err := Storage.GetAll(); err != nil {
-		return c.Fail(err.Error())
-	} else {
-		for sessionKey, sessionData := range sessions {
-			// 获取session的过期时间
-			var expiry int64
-			var sessionDataMap map[string]interface{}
-			
-			// 根据你的存储结构调整这里的逻辑
-			// 如果session存储包含过期时间信息
-			if sessInfo, ok := sessionData.(map[string]interface{}); ok {
-				if exp, exists := sessInfo["expiry"]; exists {
-					if expTime, ok := exp.(int64); ok {
-						expiry = expTime
-					} else if expTime, ok := exp.(time.Time); ok {
-						expiry = expTime.Unix()
-					}
-				}
-				sessionDataMap = sessInfo
-			} else {
-				// 如果没有过期时间信息，可以设置一个默认值或者跳过
-				expiry = time.Now().Add(24 * time.Hour).Unix() // 默认24小时后过期
-				// 尝试提取session数据
-				if extractedData, err := extractSessionDataFromMemory(sessionData); err == nil {
-					sessionDataMap = extractedData
-				} else {
-					log.Printf("错误_ExtractSessionData：%s", err.Error())
+	// 方法1: 通过US (session管理器) 获取底层存储
+	// 假设US有Store()方法返回底层存储
+	if store := US.Store(); store != nil {
+		if sessions, err := getAllSessionsFromStore(store); err == nil {
+			for _, sessionItem := range sessions {
+				// 用户名过滤
+				if !filterByUsername(sessionItem, rawUsernameFilter) {
 					continue
 				}
+				
+				// 输出当前用户名（调试用）
+				if username, ok := sessionItem["username"].(string); ok {
+					fmt.Printf("当前：%v\n", username)
+				}
+				
+				fmt.Printf("v：%v \n", sessionItem)
+				
+				// 注释掉的admin过滤逻辑保持不变
+				// usernameLower := strings.ToLower(username)
+				// if usernameLower == "admin" {
+				//     continue
+				// }
+				
+				allSessionsSlice = append(allSessionsSlice, sessionItem)
 			}
-			
-			fmt.Printf("v：%v \n", sessionDataMap)
-			
-			// 创建会话项
-			sessionItem := createSessionItem(expiry, sessionKey, sessionDataMap)
-			
-			// 用户名过滤
-			if !filterByUsername(sessionItem, rawUsernameFilter) {
-				continue
-			}
-			
-			// 输出当前用户名（调试用）
-			if username, ok := sessionItem["username"].(string); ok {
-				fmt.Printf("当前：%v\n", username)
-			}
-			
-			// 注释掉的admin过滤逻辑保持不变
-			// usernameLower := strings.ToLower(username)
-			// if usernameLower == "admin" {
-			//     continue
-			// }
-			
-			allSessions = append(allSessions, sessionItem)
+		} else {
+			log.Printf("获取sessions失败：%s", err.Error())
 		}
 	}
 	
-	// 方法2: 如果Storage是fiber的session存储，可能需要这样访问
+	// 方法2: 如果方法1不可用，尝试其他方式
+	// 这里可以添加其他获取session的方法
 	/*
-	if store, ok := Storage.(*memory.Storage); ok {
-		store.Range(func(key, value interface{}) bool {
+	// 例如：如果有全局的session映射
+	if globalSessions != nil {
+		globalSessions.Range(func(key, value interface{}) bool {
 			sessionKey := fmt.Sprintf("%v", key)
-			
-			// 处理session数据
-			sessionDataMap, err := extractSessionDataFromMemory(value)
-			if err != nil {
-				log.Printf("错误_ExtractSessionData：%s", err.Error())
-				return true // 继续遍历
+			if sessionItem, err := processSessionData(sessionKey, value); err == nil {
+				if filterByUsername(sessionItem, rawUsernameFilter) {
+					allSessionsSlice = append(allSessionsSlice, sessionItem)
+				}
 			}
-			
-			// 获取过期时间（需要根据实际存储结构调整）
-			expiry := time.Now().Add(24 * time.Hour).Unix()
-			
-			fmt.Printf("v：%v \n", sessionDataMap)
-			
-			// 创建会话项
-			sessionItem := createSessionItem(expiry, sessionKey, sessionDataMap)
-			
-			// 用户名过滤
-			if !filterByUsername(sessionItem, rawUsernameFilter) {
-				return true // 继续遍历
-			}
-			
-			// 输出当前用户名（调试用）
-			if username, ok := sessionItem["username"].(string); ok {
-				fmt.Printf("当前：%v\n", username)
-			}
-			
-			allSessions = append(allSessions, sessionItem)
-			return true // 继续遍历
+			return true
 		})
 	}
 	*/
 
 	// 排序
-	sortSessions(allSessions, sortField, sortOrder)
+	sortSessions(allSessionsSlice, sortField, sortOrder)
 	
 	// 分页
-	total := len(allSessions)
-	pagedSessions := paginateSessions(allSessions, page, limit)
+	total := len(allSessionsSlice)
+	pagedSessions := paginateSessions(allSessionsSlice, page, limit)
 	
 	// 确保返回数组而非nil
 	if pagedSessions == nil {
