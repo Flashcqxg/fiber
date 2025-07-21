@@ -30,6 +30,13 @@ const (
 // SessionItem 会话项结构
 type SessionItem map[string]interface{}
 
+// 缓存结构体类型信息以提高性能
+var (
+	sessionStoreCacheOnce sync.Once
+	sessionStorageField   *reflect.StructField
+	storageTypeCache      sync.Map // 存储不同storage类型的字段信息
+)
+
 // convertInterfaceMapToStringMap 将 map[interface{}]interface{} 转换为 map[string]interface{}
 func convertInterfaceMapToStringMap(rawData map[interface{}]interface{}) map[string]interface{} {
 	data := make(map[string]interface{}, len(rawData))
@@ -57,236 +64,414 @@ func decodeSessionData(v []byte) (map[string]interface{}, error) {
 	return convertInterfaceMapToStringMap(rawData), nil
 }
 
-// extractAllSessionsFromStore 从Fiber v3 session store中提取所有session数据
-func extractAllSessionsFromStore(store interface{}) (map[string]SessionItem, error) {
+// 快速路径：直接尝试常见的session访问方式
+func fastExtractSessions(store interface{}) (map[string]SessionItem, bool) {
 	sessions := make(map[string]SessionItem)
 	
+	// 尝试最常见的结构 - 直接访问Storage字段
 	storeValue := reflect.ValueOf(store)
 	if storeValue.Kind() == reflect.Ptr {
 		storeValue = storeValue.Elem()
 	}
 	
-	// 查找Storage字段（Fiber v3中session store包含Storage字段）
-	storageField := storeValue.FieldByName("Storage")
-	if !storageField.IsValid() {
-		return sessions, fmt.Errorf("Storage field not found in session store")
+	// 缓存Storage字段信息
+	sessionStoreCacheOnce.Do(func() {
+		storeType := storeValue.Type()
+		for i := 0; i < storeType.NumField(); i++ {
+			field := storeType.Field(i)
+			if field.Name == "Storage" {
+				sessionStorageField = &field
+				break
+			}
+		}
+	})
+	
+	if sessionStorageField != nil {
+		storageField := storeValue.FieldByName("Storage")
+		if storageField.IsValid() && !storageField.IsNil() {
+			storage := storageField.Interface()
+			if extracted := fastExtractFromStorage(storage); len(extracted) > 0 {
+				return extracted, true
+			}
+		}
 	}
 	
-	// 获取Storage接口的实际实现
-	storage := storageField.Interface()
+	return sessions, false
+}
+
+// 快速从storage中提取session
+func fastExtractFromStorage(storage interface{}) map[string]SessionItem {
+	sessions := make(map[string]SessionItem)
+	
 	storageValue := reflect.ValueOf(storage)
 	if storageValue.Kind() == reflect.Ptr {
 		storageValue = storageValue.Elem()
 	}
 	
-	// 对于memory storage，查找存储数据的内部字段
-	// 通常是sync.Map或map类型
-	err := traverseStorageFields(storageValue, sessions)
-	if err != nil {
-		return sessions, fmt.Errorf("failed to traverse storage fields: %w", err)
+	storageType := storageValue.Type()
+	cacheKey := storageType.String()
+	
+	// 检查缓存
+	if cached, ok := storageTypeCache.Load(cacheKey); ok {
+		if fieldInfo, ok := cached.([]int); ok {
+			for _, fieldIndex := range fieldInfo {
+				field := storageValue.Field(fieldIndex)
+				if fastExtractFromField(field, sessions) {
+					break // 找到数据就退出
+				}
+			}
+			return sessions
+		}
 	}
 	
-	return sessions, nil
-}
-
-// traverseStorageFields 遍历storage的字段查找session数据
-func traverseStorageFields(storageValue reflect.Value, sessions map[string]SessionItem) error {
-	storageType := storageValue.Type()
-	
+	// 第一次访问，分析字段并缓存
+	var validFields []int
 	for i := 0; i < storageValue.NumField(); i++ {
-		field := storageValue.Field(i)
 		fieldType := storageType.Field(i)
-		
-		// 跳过未导出的字段，使用unsafe包访问
-		if !fieldType.IsExported() {
-			field = reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
-		}
-		
-		// 查找可能存储session数据的字段
 		fieldName := strings.ToLower(fieldType.Name)
+		
+		// 查找可能包含session数据的字段
 		if strings.Contains(fieldName, "data") || 
 		   strings.Contains(fieldName, "store") || 
 		   strings.Contains(fieldName, "session") ||
-		   strings.Contains(fieldName, "map") {
-			
-			if err := extractFromField(field, sessions); err != nil {
-				log.Printf("Error extracting from field %s: %v", fieldType.Name, err)
-				continue
-			}
+		   strings.Contains(fieldName, "map") ||
+		   fieldName == "db" || fieldName == "storage" {
+			validFields = append(validFields, i)
 		}
 	}
 	
-	return nil
+	// 缓存字段信息
+	storageTypeCache.Store(cacheKey, validFields)
+	
+	// 尝试从这些字段中提取数据
+	for _, fieldIndex := range validFields {
+		field := storageValue.Field(fieldIndex)
+		if fastExtractFromField(field, sessions) {
+			break // 找到数据就退出
+		}
+	}
+	
+	return sessions
 }
 
-// extractFromField 从字段中提取session数据
-func extractFromField(field reflect.Value, sessions map[string]SessionItem) error {
+// 快速从字段中提取session数据
+func fastExtractFromField(field reflect.Value, sessions map[string]SessionItem) bool {
+	// 处理未导出字段
+	if !field.CanInterface() {
+		if field.CanAddr() {
+			field = reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
+		} else {
+			return false
+		}
+	}
+	
 	switch field.Kind() {
 	case reflect.Map:
-		// 处理普通map
-		return extractFromMap(field, sessions)
+		if field.IsNil() {
+			return false
+		}
+		return extractFromMapFast(field, sessions)
 		
 	case reflect.Interface, reflect.Ptr:
 		if field.IsNil() {
-			return nil
+			return false
 		}
-		// 如果是接口或指针，获取实际值
 		actual := field.Elem()
 		if actual.Kind() == reflect.Map {
-			return extractFromMap(actual, sessions)
+			return extractFromMapFast(actual, sessions)
 		}
 		
-		// 检查是否是sync.Map
-		if field.Type().String() == "*sync.Map" {
-			return extractFromSyncMap(field, sessions)
+		// 检查sync.Map
+		if field.Type().String() == "*sync.Map" || 
+		   strings.Contains(field.Type().String(), "sync.Map") {
+			return extractFromSyncMapFast(field, sessions)
 		}
 		
 	case reflect.Struct:
-		// 如果是sync.Map结构体
 		if field.Type().String() == "sync.Map" {
 			syncMapPtr := reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr()))
-			return extractFromSyncMap(syncMapPtr, sessions)
+			return extractFromSyncMapFast(syncMapPtr, sessions)
 		}
 	}
 	
-	return nil
+	return false
 }
 
-// extractFromMap 从普通map中提取session数据
-func extractFromMap(mapValue reflect.Value, sessions map[string]SessionItem) error {
+// 快速从Map中提取数据
+func extractFromMapFast(mapValue reflect.Value, sessions map[string]SessionItem) bool {
+	if mapValue.Len() == 0 {
+		return false
+	}
+	
+	count := 0
 	for _, key := range mapValue.MapKeys() {
 		value := mapValue.MapIndex(key)
 		sessionKey := fmt.Sprintf("%v", key.Interface())
 		
-		if sessionItem, err := processSessionValue(sessionKey, value.Interface()); err == nil {
+		if sessionItem, err := processSessionValueFast(sessionKey, value.Interface()); err == nil {
 			sessions[sessionKey] = sessionItem
-		} else {
-			log.Printf("Error processing session %s: %v", sessionKey, err)
+			count++
+		}
+		
+		// 限制处理数量以提高性能
+		if count > 1000 {
+			break
 		}
 	}
-	return nil
+	
+	return count > 0
 }
 
-// extractFromSyncMap 从sync.Map中提取session数据
-func extractFromSyncMap(syncMapPtr reflect.Value, sessions map[string]SessionItem) error {
+// 快速从sync.Map中提取数据
+func extractFromSyncMapFast(syncMapPtr reflect.Value, sessions map[string]SessionItem) bool {
 	if syncMap, ok := syncMapPtr.Interface().(*sync.Map); ok {
+		count := 0
 		syncMap.Range(func(key, value interface{}) bool {
 			sessionKey := fmt.Sprintf("%v", key)
-			if sessionItem, err := processSessionValue(sessionKey, value); err == nil {
+			if sessionItem, err := processSessionValueFast(sessionKey, value); err == nil {
 				sessions[sessionKey] = sessionItem
-			} else {
-				log.Printf("Error processing session %s: %v", sessionKey, err)
+				count++
 			}
-			return true
+			
+			// 限制处理数量以提高性能
+			return count < 1000
 		})
+		return count > 0
 	}
-	return nil
+	return false
 }
 
-// processSessionValue 处理session值
-func processSessionValue(sessionKey string, sessionValue interface{}) (SessionItem, error) {
-	var expiry int64
+// 优化的session值处理
+func processSessionValueFast(sessionKey string, sessionValue interface{}) (SessionItem, error) {
+	var expiry int64 = time.Now().Add(24 * time.Hour).Unix() // 默认过期时间
 	var sessionDataMap map[string]interface{}
 	
-	// 处理不同类型的session数据
+	// 快速类型判断
 	switch data := sessionValue.(type) {
 	case []byte:
-		// 如果是字节数组，尝试gob解码
-		if decoded, err := decodeSessionData(data); err == nil {
-			sessionDataMap = decoded
+		if len(data) > 0 {
+			if decoded, err := decodeSessionData(data); err == nil {
+				sessionDataMap = decoded
+			} else {
+				// 如果解码失败，尝试直接作为字符串处理
+				sessionDataMap = map[string]interface{}{
+					"raw_data": string(data),
+				}
+			}
 		} else {
-			return nil, fmt.Errorf("failed to decode session data: %w", err)
+			sessionDataMap = make(map[string]interface{})
 		}
 		
 	case map[string]interface{}:
 		sessionDataMap = data
+		// 快速查找过期时间
+		if exp, exists := data["expiry"]; exists {
+			if expTime, ok := exp.(int64); ok {
+				expiry = expTime
+			} else if expTime, ok := exp.(time.Time); ok {
+				expiry = expTime.Unix()
+			}
+		}
 		
 	case map[interface{}]interface{}:
 		sessionDataMap = convertInterfaceMapToStringMap(data)
 		
 	default:
-		// 尝试通过反射处理结构体
+		// 简化反射处理
 		val := reflect.ValueOf(sessionValue)
-		if val.Kind() == reflect.Ptr {
-			if val.IsNil() {
-				return nil, fmt.Errorf("nil session value")
-			}
+		if val.Kind() == reflect.Ptr && !val.IsNil() {
 			val = val.Elem()
 		}
 		
 		if val.Kind() == reflect.Struct {
 			sessionDataMap = make(map[string]interface{})
 			
-			// 查找Data字段
-			if dataField := val.FieldByName("Data"); dataField.IsValid() {
+			// 只查找最常见的字段名
+			if dataField := val.FieldByName("Data"); dataField.IsValid() && dataField.CanInterface() {
 				if dataMap, ok := dataField.Interface().(map[string]interface{}); ok {
 					sessionDataMap = dataMap
-				} else if dataMap, ok := dataField.Interface().(map[interface{}]interface{}); ok {
-					sessionDataMap = convertInterfaceMapToStringMap(dataMap)
 				}
 			}
 			
-			// 查找Expiry或Exp字段
-			if expiryField := val.FieldByName("Expiry"); expiryField.IsValid() {
+			// 查找过期时间字段
+			if expiryField := val.FieldByName("Expiry"); expiryField.IsValid() && expiryField.CanInterface() {
 				if expiryTime, ok := expiryField.Interface().(time.Time); ok {
 					expiry = expiryTime.Unix()
 				}
-			} else if expField := val.FieldByName("Exp"); expField.IsValid() {
-				if expTime, ok := expField.Interface().(int64); ok {
-					expiry = expTime
-				} else if expTime, ok := expField.Interface().(time.Time); ok {
-					expiry = expTime.Unix()
-				}
 			}
 		} else {
-			return nil, fmt.Errorf("unsupported session value type: %T", sessionValue)
-		}
-	}
-	
-	// 尝试从sessionDataMap中获取过期时间
-	if expiry == 0 {
-		if exp, exists := sessionDataMap["expiry"]; exists {
-			if expTime, ok := exp.(int64); ok {
-				expiry = expTime
-			} else if expTime, ok := exp.(time.Time); ok {
-				expiry = expTime.Unix()
-			}
-		} else if exp, exists := sessionDataMap["exp"]; exists {
-			if expTime, ok := exp.(int64); ok {
-				expiry = expTime
-			} else if expTime, ok := exp.(time.Time); ok {
-				expiry = expTime.Unix()
+			// 如果无法处理，创建一个基本的session
+			sessionDataMap = map[string]interface{}{
+				"session_id": sessionKey,
+				"raw_value":  fmt.Sprintf("%v", sessionValue),
 			}
 		}
 	}
 	
-	// 如果仍然没有过期时间，设置默认值
-	if expiry == 0 {
-		expiry = time.Now().Add(24 * time.Hour).Unix()
-	}
-	
-	return createSessionItem(expiry, sessionKey, sessionDataMap), nil
+	return createSessionItemFast(expiry, sessionKey, sessionDataMap), nil
 }
 
-// createSessionItem 创建会话项
-func createSessionItem(expiry int64, key string, data map[string]interface{}) SessionItem {
-	sessionItem := SessionItem{
-		"expiry":    expiry,
-		"key":       key,
-		"expiryStr": time.Unix(expiry, 0).Format(timeFormat),
-	}
+// 优化的session item创建
+func createSessionItemFast(expiry int64, key string, data map[string]interface{}) SessionItem {
+	// 预分配合适大小的map
+	sessionItem := make(SessionItem, len(data)+4)
+	sessionItem["expiry"] = expiry
+	sessionItem["key"] = key
+	sessionItem["expiryStr"] = time.Unix(expiry, 0).Format(timeFormat)
 	
-	// 将data中的所有字段合并到外层
+	// 批量复制数据
 	for k, v := range data {
 		sessionItem[k] = v
 	}
 	
-	// 确保username字段存在（用于过滤和排序）
+	// 确保username字段存在
 	if _, exists := sessionItem["username"]; !exists {
 		sessionItem["username"] = ""
 	}
 	
 	return sessionItem
+}
+
+// extractAllSessionsFromStore 从Fiber v3 session store中提取所有session数据
+func extractAllSessionsFromStore(store interface{}) (map[string]SessionItem, error) {
+	// 添加调试信息
+	fmt.Printf("🔍 开始提取sessions，store类型: %T\n", store)
+	
+	// 首先尝试快速路径
+	if sessions, found := fastExtractSessions(store); found && len(sessions) > 0 {
+		fmt.Printf("✅ 快速路径成功，找到 %d 个sessions\n", len(sessions))
+		return sessions, nil
+	}
+	
+	fmt.Printf("⚠️ 快速路径未找到数据，尝试深度扫描...\n")
+	
+	// 回退到深度扫描
+	sessions := make(map[string]SessionItem)
+	storeValue := reflect.ValueOf(store)
+	if storeValue.Kind() == reflect.Ptr {
+		storeValue = storeValue.Elem()
+	}
+	
+	// 打印store的结构信息
+	storeType := storeValue.Type()
+	fmt.Printf("📊 Store结构分析 - 类型: %s, 字段数: %d\n", storeType.Name(), storeValue.NumField())
+	
+	for i := 0; i < storeValue.NumField(); i++ {
+		field := storeValue.Field(i)
+		fieldType := storeType.Field(i)
+		fmt.Printf("  字段[%d]: %s (类型: %s, 可导出: %v)\n", 
+			i, fieldType.Name, fieldType.Type, fieldType.IsExported())
+		
+		// 如果是Storage字段，进一步分析
+		if fieldType.Name == "Storage" && field.IsValid() && !field.IsNil() {
+			storage := field.Interface()
+			storageValue := reflect.ValueOf(storage)
+			if storageValue.Kind() == reflect.Ptr {
+				storageValue = storageValue.Elem()
+			}
+			
+			storageType := storageValue.Type()
+			fmt.Printf("    🗄️ Storage分析 - 类型: %s, 字段数: %d\n", 
+				storageType.Name(), storageValue.NumField())
+			
+			for j := 0; j < storageValue.NumField(); j++ {
+				storageField := storageValue.Field(j)
+				storageFieldType := storageType.Field(j)
+				fmt.Printf("      Storage字段[%d]: %s (类型: %s, 种类: %s)\n", 
+					j, storageFieldType.Name, storageFieldType.Type, storageField.Kind())
+				
+				// 尝试从这个字段提取数据
+				if extractFromFieldWithLogging(storageField, storageFieldType.Name, sessions) {
+					fmt.Printf("✅ 从Storage.%s字段成功提取到数据\n", storageFieldType.Name)
+				}
+			}
+		}
+	}
+	
+	fmt.Printf("📈 总共提取到 %d 个sessions\n", len(sessions))
+	return sessions, nil
+}
+
+// 带日志的字段提取
+func extractFromFieldWithLogging(field reflect.Value, fieldName string, sessions map[string]SessionItem) bool {
+	fmt.Printf("    🔍 尝试从字段 %s 提取数据...\n", fieldName)
+	
+	// 处理未导出字段
+	if !field.CanInterface() {
+		if field.CanAddr() {
+			field = reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
+			fmt.Printf("      📝 使用unsafe访问私有字段\n")
+		} else {
+			fmt.Printf("      ❌ 无法访问字段\n")
+			return false
+		}
+	}
+	
+	initialCount := len(sessions)
+	
+	switch field.Kind() {
+	case reflect.Map:
+		if field.IsNil() {
+			fmt.Printf("      ❌ Map字段为nil\n")
+			return false
+		}
+		mapLen := field.Len()
+		fmt.Printf("      📊 Map字段长度: %d\n", mapLen)
+		
+		if mapLen > 0 {
+			// 打印前几个键值作为示例
+			keys := field.MapKeys()
+			for i, key := range keys {
+				if i >= 3 { // 只打印前3个
+					fmt.Printf("        ...(还有%d个)\n", mapLen-3)
+					break
+				}
+				value := field.MapIndex(key)
+				fmt.Printf("        键[%d]: %v -> %T\n", i, key.Interface(), value.Interface())
+			}
+			
+			extractFromMapFast(field, sessions)
+		}
+		
+	case reflect.Interface, reflect.Ptr:
+		if field.IsNil() {
+			fmt.Printf("      ❌ 接口/指针字段为nil\n")
+			return false
+		}
+		
+		actualType := field.Elem().Type()
+		fmt.Printf("      📎 实际类型: %s\n", actualType)
+		
+		if field.Type().String() == "*sync.Map" || 
+		   strings.Contains(field.Type().String(), "sync.Map") {
+			fmt.Printf("      🔄 发现sync.Map\n")
+			extractFromSyncMapFast(field, sessions)
+		} else if field.Elem().Kind() == reflect.Map {
+			fmt.Printf("      🗺️ 发现包装的Map\n")
+			extractFromMapFast(field.Elem(), sessions)
+		}
+		
+	case reflect.Struct:
+		fmt.Printf("      🏗️ 结构体类型: %s\n", field.Type())
+		if field.Type().String() == "sync.Map" {
+			fmt.Printf("      🔄 发现sync.Map结构体\n")
+			syncMapPtr := reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr()))
+			extractFromSyncMapFast(syncMapPtr, sessions)
+		}
+	
+	default:
+		fmt.Printf("      ❓ 未处理的字段类型: %s\n", field.Kind())
+		return false
+	}
+	
+	extracted := len(sessions) - initialCount
+	if extracted > 0 {
+		fmt.Printf("      ✅ 成功提取 %d 个sessions\n", extracted)
+		return true
+	}
+	
+	fmt.Printf("      ❌ 未提取到数据\n")
+	return false
 }
 
 // filterByUsername 根据用户名过滤会话
@@ -409,6 +594,9 @@ func GetOnlineUser(c CtxHelper) error {
 	
 	// 从US session store中提取所有session
 	if sessions, err := extractAllSessionsFromStore(US); err == nil {
+		// 预分配slice容量
+		allSessionsSlice = make([]SessionItem, 0, len(sessions))
+		
 		for _, sessionItem := range sessions {
 			// 用户名过滤
 			if !filterByUsername(sessionItem, rawUsernameFilter) {
