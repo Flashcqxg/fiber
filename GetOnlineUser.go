@@ -306,68 +306,107 @@ func processSessionValueDetailed(sessionKey string, sessionValue interface{}) (S
 		if val.Kind() == reflect.Struct {
 			sessionDataMap = make(map[string]interface{})
 			structType := val.Type()
-			fmt.Printf("                🏗️ 结构体字段数: %d\n", val.NumField())
+			fmt.Printf("                🏗️ 结构体类型: %s，字段数: %d\n", structType.Name(), val.NumField())
 			
-			// 详细分析每个字段
+			// 详细分析每个字段（包括私有字段）
 			for i := 0; i < val.NumField(); i++ {
 				field := val.Field(i)
 				fieldType := structType.Field(i)
 				
+				fmt.Printf("                  字段[%d]: %s (类型: %s, 可导出: %v, 可接口: %v)\n", 
+					i, fieldType.Name, fieldType.Type, fieldType.IsExported(), field.CanInterface())
+				
+				var fieldValue interface{}
+				var hasValue bool = false
+				
 				if field.CanInterface() {
-					fieldValue := field.Interface()
-					fmt.Printf("                  结构体字段[%d]: %s = %v (类型: %T)\n", 
-						i, fieldType.Name, fieldValue, fieldValue)
-					
+					fieldValue = field.Interface()
+					hasValue = true
+					fmt.Printf("                    ✅ 公有字段值: %v (类型: %T)\n", fieldValue, fieldValue)
+				} else {
+					// 尝试访问私有字段
+					if field.CanAddr() {
+						privateField := reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
+						if privateField.CanInterface() {
+							fieldValue = privateField.Interface()
+							hasValue = true
+							fmt.Printf("                    🔓 私有字段值: %v (类型: %T)\n", fieldValue, fieldValue)
+						} else {
+							fmt.Printf("                    ❌ 无法访问私有字段\n")
+						}
+					} else {
+						fmt.Printf("                    ❌ 字段无法取址\n")
+					}
+				}
+				
+				if hasValue {
 					// 特殊处理常见字段名
 					fieldNameLower := strings.ToLower(fieldType.Name)
 					
-					if fieldNameLower == "expiry" || fieldNameLower == "exp" {
+					if fieldNameLower == "expiry" || fieldNameLower == "exp" || fieldNameLower == "expiration" {
 						// 处理过期时间
 						if expTime, ok := fieldValue.(time.Time); ok {
 							expiry = expTime.Unix()
-							fmt.Printf("                    ⏰ 设置过期时间: %d\n", expiry)
+							fmt.Printf("                      ⏰ 设置过期时间(time.Time): %d\n", expiry)
 						} else if expTime, ok := fieldValue.(int64); ok {
 							expiry = expTime
-							fmt.Printf("                    ⏰ 设置过期时间: %d\n", expiry)
+							fmt.Printf("                      ⏰ 设置过期时间(int64): %d\n", expiry)
+						} else {
+							fmt.Printf("                      ⚠️ 过期时间类型未知: %T\n", fieldValue)
 						}
-					} else if fieldNameLower == "data" || fieldNameLower == "value" {
+					} else if fieldNameLower == "data" || fieldNameLower == "value" || fieldNameLower == "content" {
 						// 处理数据字段 - 这里可能包含实际的session数据
 						fmt.Printf("                    📊 发现数据字段: %s\n", fieldType.Name)
 						
 						if extractedData := extractDataFromField(fieldValue); extractedData != nil {
-							fmt.Printf("                    ✅ 成功提取数据字段内容\n")
+							fmt.Printf("                    ✅ 成功提取数据字段内容，字段数: %d\n", len(extractedData))
 							// 合并提取的数据
 							for k, v := range extractedData {
 								sessionDataMap[k] = v
+								fmt.Printf("                      添加字段: %s = %v\n", k, v)
 							}
+						} else {
+							fmt.Printf("                    ❌ 无法提取数据字段内容\n")
 						}
 					} else {
 						// 直接添加其他字段
 						sessionDataMap[strings.ToLower(fieldType.Name)] = fieldValue
+						fmt.Printf("                    ➕ 直接添加字段: %s = %v\n", fieldNameLower, fieldValue)
 					}
-				} else {
-					// 处理私有字段
+				}
+			}
+			
+			// 如果还是没有找到有效数据，尝试更深层的分析
+			if len(sessionDataMap) <= 1 { // 只有默认字段
+				fmt.Printf("                🔍 没有找到有效数据，尝试更深层分析...\n")
+				
+				// 尝试查找所有可能的数据存储方式
+				for i := 0; i < val.NumField(); i++ {
+					field := val.Field(i)
+					fieldType := structType.Field(i)
+					
+					// 强制访问字段
+					var fieldPtr unsafe.Pointer
 					if field.CanAddr() {
-						privateField := reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
-						if privateField.CanInterface() {
-							fieldValue := privateField.Interface()
-							fmt.Printf("                  私有字段[%d]: %s = %v (类型: %T)\n", 
-								i, fieldType.Name, fieldValue, fieldValue)
+						fieldPtr = unsafe.Pointer(field.UnsafeAddr())
+					} else {
+						// 即使无法取址，也尝试获取
+						fieldPtr = unsafe.Pointer(uintptr(unsafe.Pointer(&sessionValue)) + fieldType.Offset)
+					}
+					
+					if fieldPtr != nil {
+						fieldValue := reflect.NewAt(fieldType.Type, fieldPtr).Elem()
+						if fieldValue.CanInterface() {
+							realValue := fieldValue.Interface()
+							fmt.Printf("                    🔧 强制访问字段[%d] %s: %v (类型: %T)\n", 
+								i, fieldType.Name, realValue, realValue)
 							
-							fieldNameLower := strings.ToLower(fieldType.Name)
-							
-							if fieldNameLower == "data" || fieldNameLower == "value" {
-								fmt.Printf("                    📊 发现私有数据字段: %s\n", fieldType.Name)
-								
-								if extractedData := extractDataFromField(fieldValue); extractedData != nil {
-									fmt.Printf("                    ✅ 成功提取私有数据字段内容\n")
-									// 合并提取的数据
-									for k, v := range extractedData {
-										sessionDataMap[k] = v
-									}
+							// 检查这个字段是否包含有用信息
+							if deepData := extractDataFromField(realValue); deepData != nil {
+								fmt.Printf("                    🎯 在字段%s中找到深层数据\n", fieldType.Name)
+								for k, v := range deepData {
+									sessionDataMap[k] = v
 								}
-							} else {
-								sessionDataMap[strings.ToLower(fieldType.Name)] = fieldValue
 							}
 						}
 					}
