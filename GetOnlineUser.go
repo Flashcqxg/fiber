@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"log"
 	"reflect"
@@ -307,24 +308,69 @@ func processSessionValueDetailed(sessionKey string, sessionValue interface{}) (S
 			structType := val.Type()
 			fmt.Printf("                🏗️ 结构体字段数: %d\n", val.NumField())
 			
-			// 查找Data字段
-			if dataField := val.FieldByName("Data"); dataField.IsValid() && dataField.CanInterface() {
-				fmt.Printf("                📊 找到Data字段\n")
-				if dataMap, ok := dataField.Interface().(map[string]interface{}); ok {
-					sessionDataMap = dataMap
-				}
-			}
-			
-			// 查找所有字段并打印
+			// 详细分析每个字段
 			for i := 0; i < val.NumField(); i++ {
 				field := val.Field(i)
 				fieldType := structType.Field(i)
+				
 				if field.CanInterface() {
-					fmt.Printf("                  结构体字段[%d]: %s = %v\n", 
-						i, fieldType.Name, field.Interface())
+					fieldValue := field.Interface()
+					fmt.Printf("                  结构体字段[%d]: %s = %v (类型: %T)\n", 
+						i, fieldType.Name, fieldValue, fieldValue)
 					
-					// 将字段添加到sessionDataMap
-					sessionDataMap[strings.ToLower(fieldType.Name)] = field.Interface()
+					// 特殊处理常见字段名
+					fieldNameLower := strings.ToLower(fieldType.Name)
+					
+					if fieldNameLower == "expiry" || fieldNameLower == "exp" {
+						// 处理过期时间
+						if expTime, ok := fieldValue.(time.Time); ok {
+							expiry = expTime.Unix()
+							fmt.Printf("                    ⏰ 设置过期时间: %d\n", expiry)
+						} else if expTime, ok := fieldValue.(int64); ok {
+							expiry = expTime
+							fmt.Printf("                    ⏰ 设置过期时间: %d\n", expiry)
+						}
+					} else if fieldNameLower == "data" || fieldNameLower == "value" {
+						// 处理数据字段 - 这里可能包含实际的session数据
+						fmt.Printf("                    📊 发现数据字段: %s\n", fieldType.Name)
+						
+						if extractedData := extractDataFromField(fieldValue); extractedData != nil {
+							fmt.Printf("                    ✅ 成功提取数据字段内容\n")
+							// 合并提取的数据
+							for k, v := range extractedData {
+								sessionDataMap[k] = v
+							}
+						}
+					} else {
+						// 直接添加其他字段
+						sessionDataMap[strings.ToLower(fieldType.Name)] = fieldValue
+					}
+				} else {
+					// 处理私有字段
+					if field.CanAddr() {
+						privateField := reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
+						if privateField.CanInterface() {
+							fieldValue := privateField.Interface()
+							fmt.Printf("                  私有字段[%d]: %s = %v (类型: %T)\n", 
+								i, fieldType.Name, fieldValue, fieldValue)
+							
+							fieldNameLower := strings.ToLower(fieldType.Name)
+							
+							if fieldNameLower == "data" || fieldNameLower == "value" {
+								fmt.Printf("                    📊 发现私有数据字段: %s\n", fieldType.Name)
+								
+								if extractedData := extractDataFromField(fieldValue); extractedData != nil {
+									fmt.Printf("                    ✅ 成功提取私有数据字段内容\n")
+									// 合并提取的数据
+									for k, v := range extractedData {
+										sessionDataMap[k] = v
+									}
+								}
+							} else {
+								sessionDataMap[strings.ToLower(fieldType.Name)] = fieldValue
+							}
+						}
+					}
 				}
 			}
 		} else {
@@ -338,7 +384,111 @@ func processSessionValueDetailed(sessionKey string, sessionValue interface{}) (S
 	
 	sessionItem := createSessionItemFast(expiry, sessionKey, sessionDataMap)
 	fmt.Printf("                ✅ 创建session item成功，字段数: %d\n", len(sessionItem))
+	
+	// 打印最终的session内容用于调试
+	fmt.Printf("                🔍 最终session内容:\n")
+	for k, v := range sessionItem {
+		fmt.Printf("                    %s: %v\n", k, v)
+	}
+	
 	return sessionItem, nil
+}
+
+// extractDataFromField 从字段值中提取数据
+func extractDataFromField(fieldValue interface{}) map[string]interface{} {
+	fmt.Printf("                      🔍 分析数据字段值: %T\n", fieldValue)
+	
+	switch data := fieldValue.(type) {
+	case []byte:
+		fmt.Printf("                      📦 数据字段是字节数组，长度: %d\n", len(data))
+		if len(data) > 0 {
+			// 尝试gob解码
+			if decoded, err := decodeSessionData(data); err == nil {
+				fmt.Printf("                      ✅ gob解码成功，字段数: %d\n", len(decoded))
+				return decoded
+			} else {
+				fmt.Printf("                      ⚠️ gob解码失败: %v\n", err)
+				// 尝试作为JSON解码
+				var jsonData map[string]interface{}
+				if err := json.Unmarshal(data, &jsonData); err == nil {
+					fmt.Printf("                      ✅ JSON解码成功，字段数: %d\n", len(jsonData))
+					return jsonData
+				} else {
+					fmt.Printf("                      ⚠️ JSON解码也失败: %v\n", err)
+					// 尝试作为字符串
+					str := string(data)
+					if str != "" {
+						return map[string]interface{}{
+							"raw_data": str,
+						}
+					}
+				}
+			}
+		}
+		
+	case map[string]interface{}:
+		fmt.Printf("                      🗺️ 数据字段是string map，字段数: %d\n", len(data))
+		return data
+		
+	case map[interface{}]interface{}:
+		fmt.Printf("                      🗺️ 数据字段是interface map，字段数: %d\n", len(data))
+		return convertInterfaceMapToStringMap(data)
+		
+	case string:
+		fmt.Printf("                      📝 数据字段是字符串: %s\n", data)
+		if data != "" {
+			// 尝试解析JSON
+			var jsonData map[string]interface{}
+			if err := json.Unmarshal([]byte(data), &jsonData); err == nil {
+				fmt.Printf("                      ✅ 字符串JSON解码成功\n")
+				return jsonData
+			}
+			return map[string]interface{}{
+				"raw_string": data,
+			}
+		}
+		
+	default:
+		// 尝试反射处理
+		val := reflect.ValueOf(fieldValue)
+		if val.Kind() == reflect.Ptr && !val.IsNil() {
+			val = val.Elem()
+		}
+		
+		if val.Kind() == reflect.Struct {
+			fmt.Printf("                      🏗️ 数据字段是结构体，字段数: %d\n", val.NumField())
+			result := make(map[string]interface{})
+			structType := val.Type()
+			
+			for i := 0; i < val.NumField(); i++ {
+				field := val.Field(i)
+				fieldType := structType.Field(i)
+				
+				if field.CanInterface() {
+					result[strings.ToLower(fieldType.Name)] = field.Interface()
+					fmt.Printf("                        字段[%d]: %s = %v\n", 
+						i, fieldType.Name, field.Interface())
+				}
+			}
+			
+			return result
+		} else if val.Kind() == reflect.Map {
+			fmt.Printf("                      🗺️ 数据字段是其他类型的map\n")
+			result := make(map[string]interface{})
+			
+			for _, key := range val.MapKeys() {
+				value := val.MapIndex(key)
+				keyStr := fmt.Sprintf("%v", key.Interface())
+				if value.CanInterface() {
+					result[keyStr] = value.Interface()
+				}
+			}
+			
+			return result
+		}
+	}
+	
+	return nil
 }
 
 // 优化的session item创建
